@@ -9,6 +9,8 @@
 -- * user data
 --
 
+{-# OPTIONS_GHC -foptimal-applicative-do #-}
+{-# LANGUAGE ApplicativeDo #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ExistentialQuantification #-}
 {-# LANGUAGE ScopedTypeVariables #-}
@@ -22,6 +24,8 @@ import Control.Concurrent.STM
 import Control.Concurrent
 import Control.Monad
 import Text.Printf
+import Unsafe.Coerce
+import System.IO
 
 
 -- -----------------------------------------------------------------------------
@@ -83,11 +87,11 @@ getSync (Sync ref) = Haxl $ \_sched -> do
 
 
 -- | Block a computation on a Sync
-blockOn :: Sync a -> (a -> Haxl b) -> Sync b -> IO ()
-blockOn (Sync ref) haxl resultSync =
+blockOn :: Sync a -> WaitingFor a -> IO ()
+blockOn (Sync ref) waitingFor =
   modifyIORef' ref $ \contents ->
     case contents of
-      SyncEmpty list -> SyncEmpty (WaitingFor haxl resultSync : list)
+      SyncEmpty list -> SyncEmpty (waitingFor : list)
       _ -> error "blockOn"
 
 
@@ -112,20 +116,25 @@ instance Monad Haxl where
 instance Applicative Haxl where
   pure = return
 
-  Haxl ff <*> Haxl aa = Haxl $ \sched -> do
-    rf <- ff sched
-    ra <- aa sched
+  Haxl fio <*> Haxl aio = Haxl $ \sched -> do
+    rf <- fio sched
+    ra <- aio sched
     case (rf, ra) of
-      (Done f, Done a) -> return (Done (f a))
+      (Done f, Done a) ->
+        return (Done (f a))
       (Done f, Blocked sync acont) ->
-         return (Blocked sync (\b -> f <$> acont b))
-      (Blocked sync1 fcont, Done a) ->
-         return (Blocked sync1 (\b -> fcont b <*> return a))
-      (Blocked sync1 fcont, Blocked sync2 acont) -> do
-         i <- newSync
-         blockOn sync1 fcont i
-         let cont b = do a <- acont b; f <- getSync i; return (f a)
-         return (Blocked sync2 cont)
+        return (Blocked sync (\b -> f <$> acont b))
+      (Blocked f_sync fcont, Done a) ->
+        return (Blocked f_sync (\b -> fcont b <*> return a))
+      (Blocked f_sync fcont, Blocked a_sync acont) -> do
+        sync <- newSync
+        blockOn f_sync (WaitingFor fcont sync)
+        let
+          cont b = do
+            a <- acont b
+            f <- getSync sync
+            return (f a)
+        return (Blocked a_sync cont)
   
 
 
@@ -148,7 +157,7 @@ runHaxl haxl = do
       case r of
         Done a -> putSync sched sync a
         Blocked sync1 cont -> do
-          blockOn sync1 cont sync
+          blockOn sync1 (WaitingFor cont sync)
           reschedule sched ready
 
     putSync :: SchedState -> Sync b -> b -> IO a
@@ -158,67 +167,71 @@ runHaxl haxl = do
         SyncFull _ -> error "double put"
         SyncEmpty waiting -> do
           writeIORef ref (SyncFull val)
-          reschedule sched (map (`unblock` val) waiting)
+          if ref == unsafeCoerce result
+             then return (unsafeCoerce val)
+             else reschedule sched (map (`unblock` val) waiting)
 
     reschedule :: SchedState -> [Ready] -> IO a
     reschedule sched (Ready haxl sync : ready) = schedule sched haxl sync ready
     reschedule sched [] = do
-      r <- readIORef result
-      case r of
-        SyncFull a  -> return a
-        SyncEmpty _ -> do
-          Complete sync val <- atomically $ do
-            comps <- readTVar (completions sched)
-            case comps of
-             [] -> retry
-             (c:cs) -> do
-               writeTVar (completions sched) cs
-               return c
-          putSync sched sync val
+      Complete sync val <- atomically $ do
+        comps <- readTVar (completions sched)
+        case comps of
+          [] -> retry
+          (c:cs) -> do
+            writeTVar (completions sched) cs
+            return c
+      putSync sched sync val
 
   completions <- newTVarIO []
   schedule (SchedState completions) haxl (Sync result) []
-  r <- readIORef result
-  case r of
-    SyncFull a  -> return a
-    SyncEmpty _ -> error "missing result"
 
+
+-- -----------------------------------------------------------------------------
+-- Perform some I/O
+
+overlapIO :: IO a -> Haxl a
+overlapIO io =
+  Haxl $ \SchedState{..} -> do
+    Sync ref <- newSync
+    forkIO $ do
+      a <- io;
+      atomically $ do
+        cs <- readTVar completions
+        writeTVar completions (Complete (Sync ref) a : cs)
+    return (Blocked (Sync ref) return)
 
 
 -- -----------------------------------------------------------------------------
 -- Examples
 
+-- | wait one second and then print a character
+test :: Char -> Haxl Char
+test c = overlapIO $ do
+  threadDelay 1000000
+  putStr [c]
+  hFlush stdout
+  return c
 
-overlapIO :: IO a -> Haxl a
-overlapIO io = Haxl $ \SchedState{..} -> do
-  ref <- newIORef (SyncEmpty [])
-  forkIO $ do
-    a <- io;
-    atomically $ do
-      cs <- readTVar completions
-      writeTVar completions (Complete (Sync ref) a : cs)
-  return (Blocked (Sync ref) return)
+ex1 = runHaxl $ do sequence [ test n | n <- "abc" ]
 
-unsafeLiftIO :: IO a -> Haxl a
-unsafeLiftIO io = Haxl $ \_ -> Done <$> io
+-- >> is sequential
+ex2 = runHaxl $ separators 2 *>
+  sequence [ test 'a' >> test 'b'
+           , test 'c' >> test 'd' ]
 
-sleep :: Int -> IO ()
-sleep n = do
-  threadDelay (n*1000000)
-  printf "slept for %ds\n" n
+-- Test ApplicativeDo
+ex3 = runHaxl $ separators 3 *> do
+  a <- test 'a'
+  b <- test (const 'b' a)
+  c <- test 'c'
+  d <- test (const 'd' c)
+  e <- test (const 'e' (b,d))
+  return e
 
 
+separators n = overlapIO $ do
+  threadDelay 1100000;
+  replicateM_ n (do putStrLn "\n----"; threadDelay 1000000)
 
-{-
-Additions:
-- Pass around state: cache, scheduler state etc.
 
-- Add Throw constructor to Result. (want control over exceptions, if
-  an exception occurs in one branch doesn't necessarily kill everything)
-  - Requires a SyncResult = Ok | Throw
-
-- Add ThrowIO constructor to Result (IO exceptions must propagate properly)
-  - Requires a SyncResult = Ok | Throw | ThrowIO
-
-- Add user data
--}
