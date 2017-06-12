@@ -106,11 +106,15 @@ instance Functor Haxl where
 
 instance Monad Haxl where
   return a = Haxl $ \_ -> return (Done a)
+
   Haxl m >>= k = Haxl $ \sched -> do
     r <- m sched
     case r of
       Done a -> unHaxl (k a) sched
       Blocked sync cont -> return (Blocked sync (\b -> cont b >>= k))
+
+  (>>) = (*>)
+
 
 
 instance Applicative Haxl where
@@ -119,19 +123,23 @@ instance Applicative Haxl where
   Haxl fio <*> Haxl aio = Haxl $ \sched -> do
     rf <- fio sched
     ra <- aio sched
+
     case (rf, ra) of
       (Done f, Done a) ->
         return (Done (f a))
-      (Done f, Blocked sync acont) ->
-        return (Blocked sync (\b -> f <$> acont b))
-      (Blocked f_sync fcont, Done a) ->
-        return (Blocked f_sync (\b -> fcont b <*> return a))
-      (Blocked f_sync fcont, Blocked a_sync acont) -> do
+
+      (Done f, Blocked sync a_cont) ->
+        return (Blocked sync (\b -> f <$> a_cont b))
+
+      (Blocked f_sync f_cont, Done a) ->
+        return (Blocked f_sync (\b -> f_cont b <*> return a))
+
+      (Blocked f_sync f_cont, Blocked a_sync a_cont) -> do
         sync <- newSync
-        blockOn f_sync (WaitingFor fcont sync)
+        blockOn f_sync (WaitingFor f_cont sync)
         let
           cont b = do
-            a <- acont b
+            a <- a_cont b
             f <- getSync sync
             return (f a)
         return (Blocked a_sync cont)
@@ -209,7 +217,7 @@ overlapIO io =
 test :: Char -> Haxl Char
 test c = overlapIO $ do
   threadDelay 1000000
-  putStr [c]
+  putChar c
   hFlush stdout
   return c
 
@@ -217,8 +225,8 @@ ex1 = runHaxl $ do sequence [ test n | n <- "abc" ]
 
 -- >> is sequential
 ex2 = runHaxl $ separators 2 *>
-  sequence [ test 'a' >> test 'b'
-           , test 'c' >> test 'd' ]
+  sequence [ test 'a' >>= \_ -> test 'b'
+           , test 'c' >>= \_ -> test 'd' ]
 
 -- Test ApplicativeDo
 ex3 = runHaxl $ separators 3 *> do
@@ -235,3 +243,36 @@ separators n = overlapIO $ do
   replicateM_ n (do putStrLn "\n----"; threadDelay 1000000)
 
 
+
+softwareUpdate = runHaxl $ do
+  latest <- getLatestVersion
+  hosts <- getHosts
+  installed <- mapM getInstalledVersion hosts
+  let updates = [ h | (h,v) <- zip hosts installed, v < latest ]
+  mapM_ (updateTo latest) updates
+
+
+
+getLatestVersion :: Haxl Int
+getLatestVersion = overlapIO $ do
+  putStrLn "getLatestVersion"
+  threadDelay 1000000
+  return 3
+
+getHosts :: Haxl [String]
+getHosts = overlapIO $ do
+  putStrLn "getHosts"
+  threadDelay 1000000
+  return ["host1", "host2", "host3"]
+
+getInstalledVersion :: String -> Haxl Int
+getInstalledVersion h = overlapIO $ do
+  putStrLn "getInstalledVersion"
+  threadDelay 1000000
+  return (read (drop 4 h))
+
+updateTo :: Int -> String -> Haxl ()
+updateTo v h = overlapIO $ do
+  putStrLn "updateTo"
+  threadDelay 1000000
+  return ()
