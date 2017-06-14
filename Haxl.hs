@@ -155,33 +155,20 @@ data Ready = forall a . Ready (Haxl a) (Sync a)
 unblock :: WaitingFor a -> a -> Ready
 unblock (WaitingFor fn sync) a = Ready (fn a) sync
 
+
 runHaxl :: forall a . Haxl a -> IO a
 runHaxl haxl = do
-  result <- newIORef (SyncEmpty [])         -- where to put the result
+  Sync result <- newSync         -- where to put the result
   let
-    schedule :: SchedState -> Haxl b -> Sync b -> [Ready] -> IO a
-    schedule sched (Haxl io) sync@(Sync ref) ready = do
+    schedule :: SchedState -> [Ready] -> IO a
+    schedule sched (Ready (Haxl io) sync@(Sync ref) : ready) = do
       r <- io sched
       case r of
         Done a -> putSync sched sync a
         Blocked sync1 cont -> do
           blockOn sync1 (WaitingFor cont sync)
-          reschedule sched ready
-
-    putSync :: SchedState -> Sync b -> b -> IO a
-    putSync sched (Sync ref) val = do
-      contents <- readIORef ref
-      case contents of
-        SyncFull _ -> error "double put"
-        SyncEmpty waiting -> do
-          writeIORef ref (SyncFull val)
-          if ref == unsafeCoerce result
-             then return (unsafeCoerce val)
-             else reschedule sched (map (`unblock` val) waiting)
-
-    reschedule :: SchedState -> [Ready] -> IO a
-    reschedule sched (Ready haxl sync : ready) = schedule sched haxl sync ready
-    reschedule sched [] = do
+          schedule sched ready
+    schedule sched [] = do
       Complete sync val <- atomically $ do
         comps <- readTVar (completions sched)
         case comps of
@@ -191,9 +178,29 @@ runHaxl haxl = do
             return c
       putSync sched sync val
 
-  completions <- newTVarIO []
-  schedule (SchedState completions) haxl (Sync result) []
+    putSync :: SchedState -> Sync b -> b -> IO a
+    putSync sched (Sync ref) val = do
+      contents <- readIORef ref
+      case contents of
+        SyncFull _ -> error "double put"
+        SyncEmpty waiting -> do
+          writeIORef ref (SyncFull val)
+          case sameIORef ref result of
+            Just Same -> return val
+            Nothing -> schedule sched (map (`unblock` val) waiting)
 
+  completions <- newTVarIO []
+  schedule (SchedState completions) [Ready haxl (Sync result)]
+
+
+
+data Same a b where
+  Same :: Same a a
+
+sameIORef :: IORef a -> IORef b -> Maybe (Same a b)
+sameIORef ref1 ref2
+  | ref1 == unsafeCoerce ref2 = Just (unsafeCoerce Same)
+  | otherwise = Nothing
 
 -- -----------------------------------------------------------------------------
 -- Perform some I/O
@@ -203,7 +210,7 @@ overlapIO io =
   Haxl $ \SchedState{..} -> do
     Sync ref <- newSync
     forkIO $ do
-      a <- io;
+      a <- io
       atomically $ do
         cs <- readTVar completions
         writeTVar completions (Complete (Sync ref) a : cs)
@@ -216,35 +223,38 @@ overlapIO io =
 -- | wait one second and then print a character
 test :: Char -> Haxl Char
 test c = overlapIO $ do
+  printf "%c:start\n" c
   threadDelay 1000000
-  putChar c
-  hFlush stdout
+  printf "%c:end\n" c
   return c
 
 ex1 = runHaxl $ do sequence [ test n | n <- "abc" ]
 
 -- >> is sequential
-ex2 = runHaxl $ separators 2 *>
+ex2 = runHaxl $ annotate 2 $
   sequence [ test 'a' >>= \_ -> test 'b'
            , test 'c' >>= \_ -> test 'd' ]
 
 -- Test ApplicativeDo
-ex3 = runHaxl $ separators 3 *> do
+ex3 = runHaxl $ annotate 3 $ do
   a <- test 'a'
   b <- test (const 'b' a)
   c <- test 'c'
   d <- test (const 'd' c)
   e <- test (const 'e' (b,d))
-  return e
+  return d
 
 
-separators n = overlapIO $ do
-  threadDelay 1100000;
-  replicateM_ n (do putStrLn "\n----"; threadDelay 1000000)
+annotate :: Int -> Haxl a -> Haxl a
+annotate n haxl = separators *> (overlapIO (threadDelay 500000) >>= \_ -> haxl)
+  where
+    separators = overlapIO $ do
+      forM_ [1..n] $ \m -> do
+        threadDelay 1000000
+        printf "\n%d -----\n" m
 
 
-
-softwareUpdate = runHaxl $ do
+softwareUpdate = runHaxl $ annotate 3 $ do
   latest <- getLatestVersion
   hosts <- getHosts
   installed <- mapM getInstalledVersion hosts
@@ -255,24 +265,28 @@ softwareUpdate = runHaxl $ do
 
 getLatestVersion :: Haxl Int
 getLatestVersion = overlapIO $ do
-  putStrLn "getLatestVersion"
-  threadDelay 1000000
+  putStrLn "getLatestVersion:start"
+  threadDelay 2000000
+  putStrLn "getLatestVersion:done"
   return 3
 
 getHosts :: Haxl [String]
 getHosts = overlapIO $ do
-  putStrLn "getHosts"
+  putStrLn "getHosts:start"
   threadDelay 1000000
+  putStrLn "getHosts:done"
   return ["host1", "host2", "host3"]
 
 getInstalledVersion :: String -> Haxl Int
 getInstalledVersion h = overlapIO $ do
-  putStrLn "getInstalledVersion"
+  putStrLn "getInstalledVersion:start"
   threadDelay 1000000
+  putStrLn "getInstalledVersion:done"
   return (read (drop 4 h))
 
 updateTo :: Int -> String -> Haxl ()
 updateTo v h = overlapIO $ do
-  putStrLn "updateTo"
+  putStrLn "updateTo:start"
   threadDelay 1000000
+  putStrLn "updateTo:done"
   return ()
