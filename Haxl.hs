@@ -26,6 +26,7 @@ import Control.Monad
 import Text.Printf
 import Unsafe.Coerce
 import System.IO
+import Data.Coerce
 
 
 -- -----------------------------------------------------------------------------
@@ -161,7 +162,7 @@ runHaxl haxl = do
   Sync result <- newSync         -- where to put the result
   let
     schedule :: SchedState -> [Ready] -> IO a
-    schedule sched (Ready (Haxl io) sync@(Sync ref) : ready) = do
+    schedule sched (Ready (Haxl io) sync : ready) = do
       r <- io sched
       case r of
         Done a -> putSync sched sync a
@@ -186,7 +187,7 @@ runHaxl haxl = do
         SyncEmpty waiting -> do
           writeIORef ref (SyncFull val)
           case sameIORef ref result of
-            Just Same -> return val
+            Just fn -> return (case fn (SyncFull val) of SyncFull a -> a)
             Nothing -> schedule sched (map (`unblock` val) waiting)
 
   completions <- newTVarIO []
@@ -195,11 +196,11 @@ runHaxl haxl = do
 
 
 data Same a b where
-  Same :: Same a a
+  Same :: Coercible a b => Same a b
 
-sameIORef :: IORef a -> IORef b -> Maybe (Same a b)
+sameIORef :: IORef a -> IORef b -> Maybe (a -> b)
 sameIORef ref1 ref2
-  | ref1 == unsafeCoerce ref2 = Just (unsafeCoerce Same)
+  | ref1 == unsafeCoerce ref2 = Just unsafeCoerce
   | otherwise = Nothing
 
 -- -----------------------------------------------------------------------------
@@ -220,7 +221,7 @@ overlapIO io =
 -- -----------------------------------------------------------------------------
 -- Examples
 
--- | wait one second and then print a character
+-- | I/O that takes one second
 test :: Char -> Haxl Char
 test c = overlapIO $ do
   printf "%c:start\n" c
@@ -228,9 +229,8 @@ test c = overlapIO $ do
   printf "%c:end\n" c
   return c
 
-ex1 = runHaxl $ do sequence [ test n | n <- "abc" ]
+ex1 = runHaxl $ sequence [ test n | n <- "abc" ]
 
--- >> is sequential
 ex2 = runHaxl $ annotate 2 $
   sequence [ test 'a' >>= \_ -> test 'b'
            , test 'c' >>= \_ -> test 'd' ]
@@ -243,15 +243,6 @@ ex3 = runHaxl $ annotate 3 $ do
   d <- test (const 'd' c)
   e <- test (const 'e' (b,d))
   return d
-
-
-annotate :: Int -> Haxl a -> Haxl a
-annotate n haxl = separators *> (overlapIO (threadDelay 500000) >>= \_ -> haxl)
-  where
-    separators = overlapIO $ do
-      forM_ [1..n] $ \m -> do
-        threadDelay 1000000
-        printf "\n%d -----\n" m
 
 
 softwareUpdate = runHaxl $ annotate 3 $ do
@@ -290,3 +281,13 @@ updateTo v h = overlapIO $ do
   threadDelay 1000000
   putStrLn "updateTo:done"
   return ()
+
+
+
+annotate :: Int -> Haxl a -> Haxl a
+annotate n haxl = separators *> (overlapIO (threadDelay 500000) >>= \_ -> haxl)
+  where
+    separators = overlapIO $ do
+      forM_ [1..n] $ \m -> do
+        threadDelay 1000000
+        printf "\n%d -----\n" m
